@@ -11,7 +11,7 @@ Inspired by the frame-capture glitch aesthetic of editing-process videos.
 1. Open the page and allow camera access.
 2. Hold **both hands** up — a white rectangle stretches between them.
 3. The current effect renders live inside your frame.
-4. **Hold steady (~0.6s)** — flash! — the picture is saved at that exact spot.
+4. To save — flash! — either **open a hand** (the shutter gesture), **hold steady (~0.6s)**, or **release the frame** (drop your hands). The picture stays at that exact spot.
 5. Move away and draw the next frame; the next effect is loaded automatically.
 6. Press **C** to clear all saved pictures.
 

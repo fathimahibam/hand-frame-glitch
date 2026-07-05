@@ -3,13 +3,20 @@
 // Flow:
 //   1. Hold up both hands — they are the diagonal corners of a rectangle.
 //   2. The current effect renders live inside your rectangle.
-//   3. Hold the rectangle steady for ~1s — snap! — the picture is saved in place.
+//   3. Save by either: holding the rectangle steady for a moment — snap! —
+//      or simply releasing the frame (drop/open your hands): the last good
+//      snapshot of what you framed is saved in place.
 //   4. Move away and draw the next rectangle: the next effect is loaded.
 //   Press C to clear all saved pictures.
 //
 // Effect order (from the wxll.hx video):
 //   white embossed sketch -> green posterized -> quadtree mosaic
 //   -> blue duotone polaroid -> blue wavy hologram.
+
+import {
+  GestureRecognizer,
+  FilesetResolver,
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
 
 const video = document.getElementById("video");
 const canvas = document.getElementById("canvas");
@@ -22,10 +29,16 @@ const previewCanvas = document.createElement("canvas"); // shared buffer for liv
 
 const PROCESS_MAX = 480;   // max processing dimension
 const SMOOTH = 0.35;       // box smoothing
-const STEADY_MS = 600;     // steady hold duration required to save
-const FORCE_SAVE_MS = 1800;// frame open this long always saves, steady or not
-const REARM_DIST = 110;    // how far you must move before the next save can happen
+const STEADY_MS = 1400;    // steady hold duration required to save
+const FORCE_SAVE_MS = 4000;// frame open this long always saves, steady or not
+const REARM_DIST = 110;    // moving this far after a save re-arms immediately
+const REARM_COOLDOWN_MS = 450; // otherwise re-arm once hands close again after this long
 const MAX_STAMPS = 14;
+const PENDING_MIN_OPEN_MS = 150;  // frame must be open this long before release can save it
+const PENDING_REFRESH_MS = 120;   // how often the release snapshot is refreshed
+const PENDING_STALE_MS = 1200;    // snapshot older than this is discarded, not saved
+const RELEASE_COMMIT_MS = 140;    // hands must stay gone this long to count as a release
+const PALM_TRIGGER_MS = 150;      // hands must stay wide open this long to fire the shutter
 
 let stamps = [];           // saved pictures: {type, src, box}
 let styleIndex = 0;
@@ -39,6 +52,10 @@ let lastSaveCenter = null;
 let flashAt = -1;
 let flashBox = null;
 let ready = false;
+let pending = null;        // snapshot committed when the frame is released
+let lostMs = 0;            // how long the two-hand frame has been gone
+let openHandsMs = 0;       // how long both hands have been spread wide open
+let lastSaveAt = 0;        // when the last save happened (for the re-arm cooldown)
 
 // ---------------------------------------------------------------- helpers --
 
@@ -54,6 +71,13 @@ function palmCenter(landmarks) {
     y += landmarks[i].y;
   }
   return { x: (x / ids.length) * canvas.width, y: (y / ids.length) * canvas.height };
+}
+
+// Trained classifier's confidence that this hand shows an open palm.
+// gestureList is the recognizer's gesture ranking for one hand.
+function openPalmScore(gestureList) {
+  const g = gestureList && gestureList[0];
+  return g && g.categoryName === "Open_Palm" ? g.score : 0;
 }
 
 function boxFromHands(h1, h2) {
@@ -334,6 +358,31 @@ function drawStyled(type, src, box, now) {
   }
 }
 
+function saveStamp(type, src, box, now) {
+  stamps.push({ type, src, box: { ...box } });
+  if (stamps.length > MAX_STAMPS) stamps.shift();
+  styleIndex = (styleIndex + 1) % styles.length;
+  armed = false;
+  lastSaveCenter = { x: box.x + box.w / 2, y: box.y + box.h / 2 };
+  steadyMs = 0;
+  openMs = 0;
+  flashAt = now;
+  flashBox = { ...box };
+  pending = null;
+  openHandsMs = 0;
+  lastSaveAt = now;
+}
+
+// Save the last good snapshot when the frame is released (hands dropped/opened).
+function commitPending(now) {
+  if (!pending) return;
+  if (now - pending.at > PENDING_STALE_MS) {
+    pending = null;
+    return;
+  }
+  saveStamp(pending.type, pending.src, pending.box, now);
+}
+
 function drawHint(text) {
   ctx.save();
   ctx.font = "600 15px -apple-system, 'Segoe UI', sans-serif";
@@ -351,18 +400,10 @@ function drawHint(text) {
 
 // ------------------------------------------------------------- main loop --
 
-const hands = new Hands({
-  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
-});
+let recognizer = null;
+let lastVideoTime = -1;
 
-hands.setOptions({
-  maxNumHands: 2,
-  modelComplexity: 1,
-  minDetectionConfidence: 0.7,
-  minTrackingConfidence: 0.5,
-});
-
-hands.onResults((results) => {
+function render(results) {
   if (!ready) {
     ready = true;
     loadingEl.classList.add("hidden");
@@ -375,7 +416,8 @@ hands.onResults((results) => {
   const now = performance.now();
   const dt = lastFrameAt ? now - lastFrameAt : 16;
   lastFrameAt = now;
-  const handsList = results.multiHandLandmarks || [];
+  const handsList = results.landmarks || [];
+  const gestures = results.gestures || [];
 
   // live frame
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -386,6 +428,7 @@ hands.onResults((results) => {
   }
 
   if (handsList.length === 2) {
+    lostMs = 0;
     const { moved, box } = smoothTo(boxFromHands(handsList[0], handsList[1]));
     const bigEnough = box.w > 40 && box.h > 40;
 
@@ -396,10 +439,17 @@ hands.onResults((results) => {
       const src = style.process(box, previewCanvas);
       drawStyled(style.type, src, box, now);
 
-      // re-arm once you've moved far enough from the last save
+      const shutterPose =
+        openPalmScore(gestures[0]) >= 0.6 && openPalmScore(gestures[1]) >= 0.6;
+
+      // re-arm after a save: either move away from the last save spot, or
+      // close your hands back into a framing pose after a short cooldown —
+      // so frames near the previous one still work
       if (!armed && lastSaveCenter) {
         const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
-        if (Math.hypot(cx - lastSaveCenter.x, cy - lastSaveCenter.y) > REARM_DIST) {
+        const movedAway = Math.hypot(cx - lastSaveCenter.x, cy - lastSaveCenter.y) > REARM_DIST;
+        const cooled = now - lastSaveAt > REARM_COOLDOWN_MS && !shutterPose;
+        if (movedAway || cooled) {
           armed = true;
           openMs = 0;
           steadyMs = 0;
@@ -418,24 +468,34 @@ hands.onResults((results) => {
           Math.min(1, openMs / FORCE_SAVE_MS)
         );
 
-        if (steadyMs >= STEADY_MS || openMs >= FORCE_SAVE_MS) {
+        // keep a fresh snapshot so releasing the frame saves what you framed,
+        // not the blur of your hands moving away
+        if (openMs >= PENDING_MIN_OPEN_MS && (!pending || now - pending.at > PENDING_REFRESH_MS)) {
           const keeper = document.createElement("canvas");
           style.process(box, keeper);
-          stamps.push({ type: style.type, src: keeper, box: { ...box } });
-          if (stamps.length > MAX_STAMPS) stamps.shift();
+          pending = { type: style.type, src: keeper, box: { ...box }, at: now };
+        }
 
-          styleIndex = (styleIndex + 1) % styles.length;
-          armed = false;
-          lastSaveCenter = { x: box.x + box.w / 2, y: box.y + box.h / 2 };
-          steadyMs = 0;
-          openMs = 0;
-          flashAt = now;
-          flashBox = { ...box };
+        // open-hands shutter: hands spread wide open = snap
+        if (shutterPose) {
+          openHandsMs += dt;
+          if (pending && openHandsMs >= PALM_TRIGGER_MS) commitPending(now);
+        } else {
+          openHandsMs = 0;
+        }
+
+        if (armed && (steadyMs >= STEADY_MS || openMs >= FORCE_SAVE_MS)) {
+          const keeper = document.createElement("canvas");
+          style.process(box, keeper);
+          saveStamp(style.type, keeper, box, now);
         }
       }
     } else {
+      // frame collapsed (hands brought together) — that's a release too
+      commitPending(now);
       steadyMs = 0;
       openMs = 0;
+      openHandsMs = 0;
     }
 
     // white frame + save progress
@@ -444,22 +504,37 @@ hands.onResults((results) => {
     ctx.strokeRect(box.x, box.y, box.w, box.h);
 
     if (!bigEnough) drawHint("spread your hands to open the frame");
-    else if (!armed) drawHint("saved ✓ — move away and draw the next frame");
-    else drawHint(`effect ${styleIndex + 1}/${styles.length} — saving…`);
+    else if (!armed) drawHint("saved ✓ — curl your fingers to frame the next one");
+    else if (openHandsMs > 0) drawHint("📸 snap!");
+    else drawHint(`effect ${styleIndex + 1}/${styles.length} — spread both hands open to snap`);
   } else {
+    // debounce so a one-frame tracking dropout doesn't count as a release
+    lostMs += dt;
+    if (lostMs >= RELEASE_COMMIT_MS) commitPending(now);
     smoothBox = null;
     steadyMs = 0;
     openMs = 0;
     armed = true;
+    openHandsMs = 0;
     if (stamps.length === 0) drawHint("draw a frame with both hands");
   }
+
+  // live ✋ marker on every hand the classifier currently reads as open palm
+  ctx.font = "32px sans-serif";
+  ctx.textAlign = "center";
+  handsList.forEach((lm, i) => {
+    if (openPalmScore(gestures[i]) >= 0.6) {
+      const p = palmCenter(lm);
+      ctx.fillText("✋", p.x, p.y);
+    }
+  });
 
   // camera-snap flash on save
   if (flashAt > 0 && now - flashAt < 260 && flashBox) {
     ctx.fillStyle = `rgba(255,255,255,${0.75 * (1 - (now - flashAt) / 260)})`;
     ctx.fillRect(flashBox.x, flashBox.y, flashBox.w, flashBox.h);
   }
-});
+}
 
 window.addEventListener("keydown", (e) => {
   if (e.key.toLowerCase() === "c") stamps = [];
@@ -473,16 +548,35 @@ async function start() {
   video.srcObject = stream;
   await video.play();
 
-  const camera = new Camera(video, {
-    onFrame: async () => {
-      await hands.send({ image: video });
+  loadingEl.querySelector("p").textContent = "Loading hand tracker…";
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  const options = (delegate) => ({
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+      delegate,
     },
-    width: video.videoWidth || 1280,
-    height: video.videoHeight || 720,
+    runningMode: "VIDEO",
+    numHands: 2,
   });
-  camera.start();
+  try {
+    recognizer = await GestureRecognizer.createFromOptions(vision, options("GPU"));
+  } catch {
+    recognizer = await GestureRecognizer.createFromOptions(vision, options("CPU"));
+  }
+
+  const tick = () => {
+    if (video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      render(recognizer.recognizeForVideo(video, performance.now()));
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
 }
 
 start().catch((err) => {
-  loadingEl.querySelector("p").textContent = "Camera access failed: " + err.message;
+  loadingEl.querySelector("p").textContent = "Startup failed: " + err.message;
 });
